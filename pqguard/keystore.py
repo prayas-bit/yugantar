@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +17,7 @@ from pqguard.crypto import (
     kem_generate_keypair,
     sha256_hex,
 )
-from pqguard.storage import atomic_write_json, read_json_or_default
+from pqguard.storage import atomic_write_bytes, atomic_write_json, read_json_or_default
 
 KEYSTORE_FILE = "keystore_state.json"
 PENDING_ROTATION_FILE = "pending_rotation.json"
@@ -48,7 +50,14 @@ class DeviceRecord:
 class KeyStore:
     """Crash-safe key lifecycle and identity/device store."""
 
-    def __init__(self, state_dir: Path, grace_period_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        grace_period_seconds: float = 0.0,
+        log_signing_sk: Optional[bytes] = None,
+        log_signing_pk: Optional[bytes] = None,
+        key_dir: Optional[Path] = None,
+    ) -> None:
         if grace_period_seconds < 0:
             raise ValueError("grace_period_seconds must be non-negative")
         self.state_dir = state_dir
@@ -56,19 +65,53 @@ class KeyStore:
         self.grace_period_seconds = grace_period_seconds
         self.state_path = self.state_dir / KEYSTORE_FILE
         self.pending_path = self.state_dir / PENDING_ROTATION_FILE
+        self._key_dir = key_dir or (self.state_dir.parent / f".{self.state_dir.name}-keys")
+        self._signing_key_path = self._key_dir / "keystore_audit_signing.key"
+        self._log_signing_sk: Optional[bytes] = log_signing_sk
+        self._external_log_signing_pk: Optional[bytes] = log_signing_pk
+        self._last_wal_reconcile: Dict[str, Any] = {"had_pending": False, "malformed_wal": False}
         self.state = self._load_or_init()
+        if self.pending_path.is_file():
+            self._last_wal_reconcile = self._reconcile_pending_wal()
+
+    def _write_signing_key(self, sk: bytes) -> None:
+        self._key_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(self._signing_key_path, b64encode_str(sk).encode("ascii"))
+        try:
+            os.chmod(self._key_dir, 0o700)
+            os.chmod(self._signing_key_path, 0o600)
+        except OSError:
+            pass
 
     def _load_or_init(self) -> Dict[str, Any]:
-        # Crash recovery: if an interrupted rotation left a pending_rotation.json
-        # that was never committed to keystore_state.json, discard the uncommitted
-        # staging file and recover the last committed state.
+        # Load committed state without silently discarding pending_rotation.json;
+        # WAL reconciliation and audit logging happen once signing keys are available.
         existing = read_json_or_default(self.state_path, None)
-        if self.pending_path.is_file():
-            self.pending_path.unlink(missing_ok=True)
         if existing is not None:
+            # Migrate legacy plaintext log_signing_sk_b64 out of state file if present.
+            if "log_signing_sk_b64" in existing:
+                legacy_sk = b64decode_bytes(existing.pop("log_signing_sk_b64"))
+                if self._log_signing_sk is None:
+                    self._log_signing_sk = legacy_sk
+                    self._write_signing_key(legacy_sk)
+                atomic_write_json(self.state_path, existing)
+            elif self._log_signing_sk is None:
+                if not self._signing_key_path.is_file():
+                    raise RuntimeError(
+                        "Keystore audit signing private key missing; refusing to silently rotate signing identity."
+                    )
+                self._log_signing_sk = b64decode_bytes(
+                    self._signing_key_path.read_text(encoding="ascii").strip()
+                )
             return existing
 
-        log_pk, log_sk = dsa_generate_keypair()
+        if self._log_signing_sk is not None and self._external_log_signing_pk is not None:
+            log_pk, log_sk = self._external_log_signing_pk, self._log_signing_sk
+        else:
+            log_pk, log_sk = dsa_generate_keypair()
+            self._log_signing_sk = log_sk
+            self._write_signing_key(log_sk)
+
         kem_pk, kem_sk = kem_generate_keypair()
         now = time.time()
         v1 = KeyVersionRecord(
@@ -91,9 +134,9 @@ class KeyStore:
             "revoked_actors": [],
             "devices": {},
             "log_signing_pk_b64": b64encode_str(log_pk),
-            "log_signing_sk_b64": b64encode_str(log_sk),
         }
         atomic_write_json(self.state_path, state)
+        self.state = state
         self.audit_log.append(
             actor="system",
             action="keystore_init",
@@ -104,12 +147,12 @@ class KeyStore:
 
     @property
     def audit_log(self) -> TamperEvidentAuditLog:
-        sk_b64 = self.state.get("log_signing_sk_b64") if hasattr(self, "state") else None
-        sk = b64decode_bytes(sk_b64) if sk_b64 else None
-        return TamperEvidentAuditLog(self.state_dir / "keystore_audit.jsonl", signing_sk=sk)
+        return TamperEvidentAuditLog(self.state_dir / "keystore_audit.jsonl", signing_sk=self._log_signing_sk)
 
     @property
     def log_signing_pk(self) -> bytes:
+        if self._external_log_signing_pk is not None:
+            return self._external_log_signing_pk
         return b64decode_bytes(self.state["log_signing_pk_b64"])
 
     def _save(self) -> None:
@@ -203,10 +246,46 @@ class KeyStore:
         )
         return new_ver
 
+    def _reconcile_pending_wal(self) -> Dict[str, Any]:
+        """Inspect pending WAL, record recovery outcome in audit log BEFORE unlinking, and clean up idempotently."""
+        if not self.pending_path.is_file():
+            return {"had_pending": False, "malformed_wal": False}
+
+        malformed = False
+        wal_details: Dict[str, Any] = {}
+        try:
+            raw_text = self.pending_path.read_text(encoding="utf-8", errors="replace")
+            parsed = json.loads(raw_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("WAL record is not a JSON object")
+            wal_details = {
+                "from_version": parsed.get("from_version"),
+                "to_version": parsed.get("to_version"),
+                "staged_at": parsed.get("staged_at"),
+            }
+        except Exception as exc:
+            malformed = True
+            wal_details = {"error": str(exc), "malformed_wal": True}
+
+        outcome = "malformed_wal_discarded" if malformed else "rolled_back"
+        try:
+            self.audit_log.append(
+                actor="system",
+                action="wal_recovery",
+                outcome=outcome,
+                details=wal_details,
+            )
+        finally:
+            self.pending_path.unlink(missing_ok=True)
+
+        return {"had_pending": True, "malformed_wal": malformed, "details": wal_details}
+
     def recover_after_crash(self) -> Dict[str, Any]:
         """Recover consistent state after an interrupted rotation or restart."""
-        had_pending = self.pending_path.is_file()
-        self.pending_path.unlink(missing_ok=True)
+        wal_info = self._reconcile_pending_wal()
+        had_pending = wal_info["had_pending"] or self._last_wal_reconcile.get("had_pending", False)
+        malformed_wal = wal_info["malformed_wal"] or self._last_wal_reconcile.get("malformed_wal", False)
+        self._last_wal_reconcile = {"had_pending": False, "malformed_wal": False}
         self.state = read_json_or_default(self.state_path, self.state)
 
         # Ensure monotonicity: every version in revoked_versions stays revoked.
@@ -236,12 +315,14 @@ class KeyStore:
             outcome="success",
             details={
                 "rolled_back_pending_rotation": had_pending,
+                "malformed_wal": malformed_wal,
                 "recovered_active_version": active_ver,
                 "revoked_versions": sorted(revoked_set),
             },
         )
         return {
             "rolled_back_pending_rotation": had_pending,
+            "malformed_wal": malformed_wal,
             "active_version": active_ver,
             "revoked_versions": sorted(revoked_set),
         }

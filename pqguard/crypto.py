@@ -131,7 +131,12 @@ def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes = b"") 
 
 
 def zeroize_bytearray(buf: bytearray | None) -> None:
-    """Best-effort in-place zeroization of mutable secret buffers."""
+    """Best-effort in-place zeroization of mutable bytearray secret buffers.
+
+    Limitation (F-12): CPython immutable `bytes` returned by CFFI/pqcrypto and
+    hashlib/hmac cannot be deterministically wiped in user-space Python and may
+    persist in the heap until garbage collection.
+    """
     if buf is None:
         return
     for idx in range(len(buf)):

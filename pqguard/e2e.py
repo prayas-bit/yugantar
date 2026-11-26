@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import secrets
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -115,12 +116,13 @@ class E2ESession:
         peer_id: str,
         chain_key: bytes,
         max_reorder_buffer: int = 64,
+        recv_chain_key: Optional[bytes] = None,
     ) -> None:
         self.session_id = session_id
         self.local_id = local_id
         self.peer_id = peer_id
         self._send_chain = bytearray(chain_key)
-        self._recv_chain = bytearray(chain_key)
+        self._recv_chain = bytearray(recv_chain_key if recv_chain_key is not None else chain_key)
         self.send_seq = 1
         self.expected_recv_seq = 1
         self._seen_msg_ids: Set[str] = set()
@@ -137,25 +139,31 @@ class E2ESession:
         )
         return msg_key, bytearray(next_chain)
 
-    def _get_or_advance_recv_key(self, seq: int) -> bytes:
-        if seq in self._recv_key_cache:
-            return bytes(self._recv_key_cache[seq])
-        if seq < self.expected_recv_seq:
+    def _stage_recv_key(self, seq: int) -> Tuple[bytes, Optional[bytearray], Dict[int, bytearray]]:
+        """Derive candidate message key on temporary state without mutating self._recv_chain."""
+        if not isinstance(seq, int) or seq < self.expected_recv_seq:
             raise ValueError(f"Replay or expired sequence number: {seq}")
         if seq - self.expected_recv_seq > self.max_reorder_buffer:
             raise ValueError(f"Sequence {seq} exceeds reorder window")
+        if seq in self._recv_key_cache:
+            return bytes(self._recv_key_cache[seq]), None, {}
 
-        # Advance receive chain up to seq, caching skipped keys for out-of-order delivery
+        temp_chain = bytearray(self._recv_chain)
+        staged_cache: Dict[int, bytearray] = {}
         cursor = self.expected_recv_seq
         while cursor in self._recv_key_cache:
             cursor += 1
+        target_key = b""
         while cursor <= seq:
-            msg_key, next_chain = self._derive_msg_and_next_chain(self._recv_chain, cursor)
-            zeroize_bytearray(self._recv_chain)
-            self._recv_chain = next_chain
-            self._recv_key_cache[cursor] = bytearray(msg_key)
+            msg_key, next_chain = self._derive_msg_and_next_chain(temp_chain, cursor)
+            zeroize_bytearray(temp_chain)
+            temp_chain = next_chain
+            if cursor == seq:
+                target_key = msg_key
+            else:
+                staged_cache[cursor] = bytearray(msg_key)
             cursor += 1
-        return bytes(self._recv_key_cache[seq])
+        return target_key, temp_chain, staged_cache
 
     def encrypt_message(self, plaintext: bytes, msg_id: Optional[str] = None) -> EncryptedEnvelope:
         """Encrypt and bind a message to sender, recipient, session, and sequence number."""
@@ -196,16 +204,25 @@ class E2ESession:
         if env.msg_id in self._seen_msg_ids or env.seq in self._seen_seqs:
             return [], DeliveryFailure(seq=env.seq, reason="replay_detected")
 
+        staged_chain: Optional[bytearray] = None
+        staged_cache: Dict[int, bytearray] = {}
         try:
-            msg_key = self._get_or_advance_recv_key(env.seq)
+            msg_key, staged_chain, staged_cache = self._stage_recv_key(env.seq)
             nonce = b64decode_bytes(env.nonce_b64)
             ct = b64decode_bytes(env.ciphertext_b64)
             aad = _aad_bytes(env.session_id, env.msg_id, env.seq, env.sender_id, env.recipient_id)
             plaintext = aead_decrypt(msg_key, nonce, ct, aad=aad)
         except Exception as exc:
+            zeroize_bytearray(staged_chain)
+            for buf in staged_cache.values():
+                zeroize_bytearray(buf)
             return [], DeliveryFailure(seq=env.seq, reason=f"authentication_failed:{type(exc).__name__}")
 
-        # Erase used message key immediately
+        # Commit receive-chain advancement and skipped keys ONLY after authentication succeeds.
+        if staged_chain is not None:
+            zeroize_bytearray(self._recv_chain)
+            self._recv_chain = staged_chain
+            self._recv_key_cache.update(staged_cache)
         if env.seq in self._recv_key_cache:
             zeroize_bytearray(self._recv_key_cache.pop(env.seq))
 
@@ -296,14 +313,18 @@ class E2EHandshakeState:
         zeroize_bytearray(self._eph_sk)
         self._eph_sk = None
 
-        chain_key = hkdf_sha256(
-            shared_secret, 32, salt=self.session_id.encode("utf-8"), info=b"pqguard-e2e-chain-v1"
+        i2r_chain = hkdf_sha256(
+            shared_secret, 32, salt=self.session_id.encode("utf-8"), info=b"pqguard-e2e-i2r-v1"
+        )
+        r2i_chain = hkdf_sha256(
+            shared_secret, 32, salt=self.session_id.encode("utf-8"), info=b"pqguard-e2e-r2i-v1"
         )
         return E2ESession(
             session_id=self.session_id,
             local_id=self.initiator.identity_id,
             peer_id=self.responder_id,
-            chain_key=chain_key,
+            chain_key=i2r_chain,
+            recv_chain_key=r2i_chain,
         )
 
 
@@ -333,16 +354,30 @@ def accept_handshake(
         kem_ciphertext_b64=b64encode_str(kem_ct),
         signature_b64=b64encode_str(accept_sig),
     )
-    chain_key = hkdf_sha256(
-        shared_secret, 32, salt=init.session_id.encode("utf-8"), info=b"pqguard-e2e-chain-v1"
+    i2r_chain = hkdf_sha256(
+        shared_secret, 32, salt=init.session_id.encode("utf-8"), info=b"pqguard-e2e-i2r-v1"
+    )
+    r2i_chain = hkdf_sha256(
+        shared_secret, 32, salt=init.session_id.encode("utf-8"), info=b"pqguard-e2e-r2i-v1"
     )
     session = E2ESession(
         session_id=init.session_id,
         local_id=responder.identity_id,
         peer_id=init.initiator_id,
-        chain_key=chain_key,
+        chain_key=r2i_chain,
+        recv_chain_key=i2r_chain,
     )
     return accept, session
+
+
+@dataclass(frozen=True)
+class ResumptionChallenge:
+    challenge_id: str
+    session_id: str
+    peer_id: str
+    nonce_b64: str
+    issued_at: float
+    expires_at: float
 
 
 @dataclass(frozen=True)
@@ -353,11 +388,56 @@ class ResumptionResult:
     peer_id: Optional[str] = None
 
 
+def _resumption_pop_transcript(
+    challenge: ResumptionChallenge,
+    ticket_str: str,
+) -> bytes:
+    ticket_hash = sha256_hex(ticket_str.encode("utf-8"))
+    return (
+        f"pqguard-resume-pop-v1|{challenge.challenge_id}|{challenge.nonce_b64}|"
+        f"{challenge.session_id}|{challenge.peer_id}|{challenge.expires_at}|{ticket_hash}"
+    ).encode("utf-8")
+
+
+def sign_resumption_challenge(
+    identity: IdentityKeyPair,
+    challenge: ResumptionChallenge,
+    ticket_str: str,
+) -> str:
+    """Sign a session-resumption PoP challenge with the peer's ML-DSA-65 private key."""
+    transcript = _resumption_pop_transcript(challenge, ticket_str)
+    return b64encode_str(dsa_sign(identity.dsa_sk, transcript))
+
+
 class SessionResumptionAuthority:
-    """Issues and verifies identity-bound, policy-checked session resumption tickets."""
+    """Issues and verifies identity-bound, PoP-authenticated session resumption tickets."""
 
     def __init__(self, ticket_key: Optional[bytes] = None) -> None:
         self._ticket_key = ticket_key if ticket_key is not None else secrets.token_bytes(32)
+        self._lock = threading.Lock()
+        self._pending_challenges: Dict[str, ResumptionChallenge] = {}
+        self._consumed_challenges: Set[str] = set()
+
+    def issue_challenge(
+        self,
+        session_id: str,
+        peer_id: str,
+        ttl_seconds: float = 30.0,
+        now: Optional[float] = None,
+    ) -> ResumptionChallenge:
+        ts = time.time() if now is None else now
+        cid = f"rc-{secrets.token_hex(12)}"
+        challenge = ResumptionChallenge(
+            challenge_id=cid,
+            session_id=session_id,
+            peer_id=peer_id,
+            nonce_b64=b64encode_str(secrets.token_bytes(32)),
+            issued_at=ts,
+            expires_at=ts + ttl_seconds,
+        )
+        with self._lock:
+            self._pending_challenges[cid] = challenge
+        return challenge
 
     def issue_ticket(
         self,
@@ -385,10 +465,33 @@ class SessionResumptionAuthority:
         claimed_session_id: str,
         caller_id: str,
         caller_dsa_pk: bytes,
+        challenge_id: Optional[str] = None,
+        proof_signature_b64: Optional[str] = None,
         is_peer_authorized_fn: Optional[Callable[[str], bool]] = None,
         now: Optional[float] = None,
     ) -> ResumptionResult:
         ts = time.time() if now is None else now
+        if not challenge_id or not proof_signature_b64:
+            return ResumptionResult(allowed=False, reason="missing_pop_proof")
+
+        with self._lock:
+            if challenge_id in self._consumed_challenges:
+                return ResumptionResult(allowed=False, reason="replayed_challenge")
+            challenge = self._pending_challenges.get(challenge_id)
+            if challenge is None:
+                return ResumptionResult(allowed=False, reason="unknown_challenge")
+            if ts > challenge.expires_at:
+                self._pending_challenges.pop(challenge_id, None)
+                self._consumed_challenges.add(challenge_id)
+                return ResumptionResult(allowed=False, reason="challenge_expired")
+
+        # Validate metadata, ticket, and PoP signature BEFORE consuming the challenge
+        # so an unauthenticated party cannot burn another peer's outstanding challenge.
+        if challenge.session_id != claimed_session_id:
+            return ResumptionResult(allowed=False, reason="challenge_session_mismatch")
+        if challenge.peer_id != caller_id:
+            return ResumptionResult(allowed=False, reason="challenge_peer_mismatch")
+
         try:
             wrapper = json.loads(ticket_str)
             nonce = b64decode_bytes(wrapper["n"])
@@ -406,8 +509,23 @@ class SessionResumptionAuthority:
             return ResumptionResult(allowed=False, reason="peer_identity_mismatch")
         if ticket.get("peer_dsa_pk_sha256") != sha256_hex(caller_dsa_pk):
             return ResumptionResult(allowed=False, reason="peer_key_mismatch")
+
+        try:
+            sig_bytes = b64decode_bytes(proof_signature_b64)
+        except Exception:
+            return ResumptionResult(allowed=False, reason="invalid_pop_signature_encoding")
+        transcript = _resumption_pop_transcript(challenge, ticket_str)
+        if not dsa_verify(caller_dsa_pk, transcript, sig_bytes):
+            return ResumptionResult(allowed=False, reason="invalid_pop_signature")
+
         if is_peer_authorized_fn is not None and not is_peer_authorized_fn(caller_id):
             return ResumptionResult(allowed=False, reason="peer_revoked_or_unauthorized")
+
+        with self._lock:
+            if challenge_id in self._consumed_challenges or challenge_id not in self._pending_challenges:
+                return ResumptionResult(allowed=False, reason="replayed_challenge")
+            self._pending_challenges.pop(challenge_id, None)
+            self._consumed_challenges.add(challenge_id)
 
         return ResumptionResult(
             allowed=True,

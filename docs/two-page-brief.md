@@ -4,7 +4,7 @@
 
 **Project:** PQGuard  
 **Team:** Yugantar Track 4 Team  
-**Repository and commit:** *(Insert public GitHub URL and commit hash before submission)*  
+**Repository:** https://github.com/prayas-bit/yugantar  
 **Demo entry point:** `python demo_walkthrough.py` (and `track4_service.py` for Adapter v1)
 
 ### Unique Selling Proposition (USP)

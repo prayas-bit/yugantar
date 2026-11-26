@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ class ServiceNode:
     key_versions: Dict[int, dict] = None  # type: ignore[assignment]
     revoked_versions: set[int] = None  # type: ignore[assignment]
     revoked_devices: set[str] = None  # type: ignore[assignment]
+    devices: Dict[str, dict] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.key_versions is None:
@@ -25,13 +27,16 @@ class ServiceNode:
             self.revoked_versions = set()
         if self.revoked_devices is None:
             self.revoked_devices = set()
+        if self.devices is None:
+            self.devices = {}
 
     def sync_from(self, keystore: KeyStore) -> float:
-        """Pull latest key versions and revocation lists from the keystore."""
-        self.key_versions = {int(k): dict(v) for k, v in keystore.state["key_versions"].items()}
+        """Pull an isolated snapshot of key versions, devices, and revocations from keystore."""
+        self.key_versions = {int(k): copy.deepcopy(v) for k, v in keystore.state["key_versions"].items()}
         self.revoked_versions = set(keystore.state.get("revoked_versions", []))
+        self.devices = {dev_id: copy.deepcopy(dev) for dev_id, dev in keystore.state.get("devices", {}).items()}
         self.revoked_devices = {
-            dev_id for dev_id, dev in keystore.state.get("devices", {}).items() if dev.get("status") == "revoked"
+            dev_id for dev_id, dev in self.devices.items() if dev.get("status") == "revoked"
         }
         self.synced_epoch = int(keystore.state.get("revocation_epoch", 0))
         self.last_sync_ts = time.perf_counter()
@@ -42,14 +47,14 @@ class ServiceNode:
         actor: str,
         device_id: str,
         key_version: int,
-        keystore: KeyStore,
+        keystore: Optional[KeyStore] = None,
         now: Optional[float] = None,
     ) -> Tuple[bool, str]:
-        """Enforce device revocation and key-version rotation cutoff locally on this node."""
+        """Enforce device revocation and key-version rotation cutoff using only synced node state."""
         ts = time.time() if now is None else now
         if device_id in self.revoked_devices:
             return False, f"{self.node_id}:device_revoked"
-        dev = keystore.state.get("devices", {}).get(device_id)
+        dev = self.devices.get(device_id)
         if dev is None or dev.get("actor") != actor or dev.get("status") != "active":
             return False, f"{self.node_id}:device_unauthorized"
 

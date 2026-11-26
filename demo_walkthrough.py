@@ -25,6 +25,7 @@ from pqguard.e2e import (
     IdentityKeyPair,
     SessionResumptionAuthority,
     accept_handshake,
+    sign_resumption_challenge,
 )
 from pqguard.keystore import KeyStore
 from pqguard.nodes import NodeCluster
@@ -158,8 +159,16 @@ def main() -> None:
 
         res_auth = SessionResumptionAuthority()
         ticket = res_auth.issue_ticket("sess-e2e", "alice", alice_id.dsa_pk)
-        ok_res = res_auth.resume_session(ticket, "sess-e2e", "alice", alice_id.dsa_pk, lambda _: True)
-        bad_res = res_auth.resume_session(ticket, "sess-e2e", "eve", eve_id.dsa_pk, lambda _: True)
+        ch_ok = res_auth.issue_challenge("sess-e2e", "alice")
+        sig_ok = sign_resumption_challenge(alice_id, ch_ok, ticket)
+        ok_res = res_auth.resume_session(
+            ticket, "sess-e2e", "alice", alice_id.dsa_pk, ch_ok.challenge_id, sig_ok, lambda _: True
+        )
+        ch_bad = res_auth.issue_challenge("sess-e2e", "eve")
+        sig_bad = sign_resumption_challenge(eve_id, ch_bad, ticket)
+        bad_res = res_auth.resume_session(
+            ticket, "sess-e2e", "eve", eve_id.dsa_pk, ch_bad.challenge_id, sig_bad, lambda _: True
+        )
         print(
             f"[9-12] E2E Messaging: reordered_delivery={[x[1].decode() for x in d1]}, "
             f"replay={replay_err.reason if replay_err else None}, "

@@ -19,7 +19,9 @@ from pqguard.crypto import (
     sha256_hex,
 )
 from pqguard.keystore import KeyStore
-from pqguard.storage import atomic_write_json
+from pqguard.storage import atomic_write_json, read_json_or_default
+
+EPOCH_WATERMARK_FILE = "epoch_watermark.json"
 
 
 @dataclass(frozen=True)
@@ -67,11 +69,13 @@ def create_backup(
     aad = f"{bid}:{payload_digest}".encode("utf-8")
     nonce, ciphertext = aead_encrypt(enc_key, payload_bytes, aad=aad)
 
+    rev_epoch = int(keystore.state.get("revocation_epoch", 0))
     manifest = {
         "format": "pqguard-backup-v1",
         "backup_id": bid,
         "created_at": time.time(),
         "active_version": keystore.active_version(),
+        "revocation_epoch": rev_epoch,
         "payload_sha256": payload_digest,
         "ciphertext_sha256": sha256_hex(ciphertext),
         "nonce_b64": b64encode_str(nonce),
@@ -97,8 +101,9 @@ def restore_backup(
     target_state_dir: Path,
     master_secret: bytes,
     signing_pk: bytes,
+    expected_min_epoch: Optional[int] = None,
 ) -> RestoreResult:
-    """Verify ML-DSA-65 signature, SHA-256 digests, and AES-GCM tag before restoring."""
+    """Verify ML-DSA-65 signature, SHA-256 digests, AES-GCM tag, and monotonic revocation_epoch before restoring."""
     if not backup_path.is_file():
         return RestoreResult(verified=False, error="Backup file does not exist")
 
@@ -124,6 +129,7 @@ def restore_backup(
         ciphertext = b64decode_bytes(manifest["ciphertext_b64"])
         expected_ct_hash = str(manifest["ciphertext_sha256"])
         expected_pt_hash = str(manifest["payload_sha256"])
+        manifest_epoch = int(manifest.get("revocation_epoch", 0))
     except Exception as exc:
         return RestoreResult(verified=False, error=f"Invalid backup manifest fields: {exc}")
 
@@ -153,8 +159,50 @@ def restore_backup(
         )
 
     restored_state = json.loads(plaintext.decode("utf-8"))
+    backup_epoch = int(restored_state.get("revocation_epoch", 0))
+    if backup_epoch != manifest_epoch:
+        return RestoreResult(
+            verified=False,
+            backup_id=bid,
+            error="Backup manifest revocation_epoch does not match encrypted payload",
+        )
+
     target_state_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(target_state_dir / "keystore_state.json", restored_state)
+    live_state_path = target_state_dir / "keystore_state.json"
+    watermark_path = target_state_dir / EPOCH_WATERMARK_FILE
+    live_state = read_json_or_default(live_state_path, None)
+    watermark = read_json_or_default(watermark_path, {})
+
+    live_epoch = int(live_state.get("revocation_epoch", 0)) if isinstance(live_state, dict) else 0
+    watermark_epoch = int(watermark.get("min_revocation_epoch", 0)) if isinstance(watermark, dict) else 0
+    min_allowed_epoch = max(live_epoch, watermark_epoch, int(expected_min_epoch or 0))
+
+    if backup_epoch < min_allowed_epoch:
+        return RestoreResult(
+            verified=False,
+            backup_id=bid,
+            error=f"Backup rollback rejected: backup epoch {backup_epoch} < current epoch {min_allowed_epoch}",
+        )
+
+    # Preserve monotonic revocations if live_state exists at the same epoch.
+    if isinstance(live_state, dict):
+        merged_rev_vers = sorted(
+            set(restored_state.get("revoked_versions", [])) | set(live_state.get("revoked_versions", []))
+        )
+        restored_state["revoked_versions"] = merged_rev_vers
+        for ver in merged_rev_vers:
+            if str(ver) in restored_state.get("key_versions", {}):
+                restored_state["key_versions"][str(ver)]["status"] = "revoked"
+        restored_state["revoked_actors"] = sorted(
+            set(restored_state.get("revoked_actors", [])) | set(live_state.get("revoked_actors", []))
+        )
+        for dev_id, live_dev in live_state.get("devices", {}).items():
+            if live_dev.get("status") == "revoked" and dev_id in restored_state.get("devices", {}):
+                restored_state["devices"][dev_id]["status"] = "revoked"
+                restored_state["devices"][dev_id]["revoked_at"] = live_dev.get("revoked_at")
+
+    atomic_write_json(live_state_path, restored_state)
+    atomic_write_json(watermark_path, {"min_revocation_epoch": backup_epoch})
     return RestoreResult(
         verified=True,
         backup_id=bid,

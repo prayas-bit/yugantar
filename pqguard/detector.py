@@ -164,11 +164,13 @@ class ContextAwareDetector:
         allowed_edges: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
         clock_uncertainty_ms: int = DEFAULT_CLOCK_UNCERTAINTY_MS,
         max_clock_offset_ms: int = DEFAULT_MAX_CLOCK_OFFSET_MS,
+        lateral_window_seconds: float = 60.0,
     ) -> None:
         self.approvals = approvals or {}
         self.allowed_edges = allowed_edges or DEFAULT_ALLOWED_EDGES
         self.clock_uncertainty_ms = clock_uncertainty_ms
         self.max_clock_offset_ms = max_clock_offset_ms
+        self.lateral_window_seconds = lateral_window_seconds
 
     def _is_approved_role_change(self, evt: AccessEvent) -> bool:
         if not evt.approval_id or evt.approval_id not in self.approvals:
@@ -179,9 +181,7 @@ class ContextAwareDetector:
             return app.get("approved_by") == evt.actor
         if evt.action == "revoke_role":
             return app.get("approved_by") == evt.actor and op == "revoke_role"
-        if evt.action == "role_change":
-            if op != "grant_role":
-                return False
+        if op == "grant_role":
             if app.get("subject") != evt.actor or app.get("role") != evt.role_after:
                 return False
             v_from = parse_utc_ms(app["valid_from_utc"])
@@ -265,10 +265,12 @@ class ContextAwareDetector:
         alerts: List[Alert] = []
         alert_counter = 0
 
-        # Track unapproved role changes per (actor, session_id)
+        # Track unapproved role changes per (actor, session_id) regardless of action label
         tainted_sessions: Dict[Tuple[str, str], str] = {}
         for evt in timeline:
-            if evt.action == "role_change" and evt.role_before != evt.role_after:
+            role_before = evt.role_before.strip() if isinstance(evt.role_before, str) else ""
+            role_after = evt.role_after.strip() if isinstance(evt.role_after, str) else ""
+            if role_before and role_after and role_before != role_after:
                 if self._is_approved_role_change(evt):
                     event_classifications[evt.event_id] = "approved_change"
                 else:
@@ -285,11 +287,12 @@ class ContextAwareDetector:
                             services=[evt.source_service, evt.target_service],
                             event_ids=[evt.event_id],
                             rule="unapproved_privilege_escalation",
-                            path=f"{evt.source_service} -> {evt.target_service} ({evt.role_before}->{evt.role_after})",
+                            path=f"{evt.source_service} -> {evt.target_service} ({role_before}->{role_after})",
                             outcomes=[evt.outcome],
                             explanation=(
-                                f"Role change for {evt.actor} ({evt.role_before} -> {evt.role_after}) "
-                                f"has no matching valid approval in change-control context."
+                                f"Role change for {evt.actor} via action '{evt.action}' "
+                                f"({role_before} -> {role_after}) has no matching valid approval "
+                                f"in change-control context."
                             ),
                         )
                     )
@@ -355,9 +358,62 @@ class ContextAwareDetector:
                         ),
                     )
                 )
-            else:
-                for fe in flow_events:
-                    event_classifications[fe.event_id] = "isolated_denial" if fe.outcome == "deny" else "routine"
+
+        # Secondary sliding-window correlation per actor to catch rotating correlation/session IDs
+        by_actor_remaining: Dict[str, List[AccessEvent]] = {}
+        for evt in timeline:
+            if evt.event_id in event_classifications:
+                continue
+            if not self._is_expected_edge(evt):
+                by_actor_remaining.setdefault(evt.actor, []).append(evt)
+
+        for actor, actor_events in by_actor_remaining.items():
+            # Partition actor's remaining unexpected edges into time-contiguous windows
+            clusters: List[List[AccessEvent]] = []
+            for evt in actor_events:
+                if not clusters:
+                    clusters.append([evt])
+                else:
+                    delta = (evt.corrected_time - clusters[-1][-1].corrected_time).total_seconds()
+                    if delta <= self.lateral_window_seconds:
+                        clusters[-1].append(evt)
+                    else:
+                        clusters.append([evt])
+
+            for cluster in clusters:
+                distinct_targets = {e.target_service for e in cluster}
+                if len(cluster) >= 2 and len(distinct_targets) >= 2:
+                    services: List[str] = []
+                    for fe in cluster:
+                        if not services or services[-1] != fe.source_service:
+                            services.append(fe.source_service)
+                        services.append(fe.target_service)
+                    path_str = " -> ".join(services)
+                    for fe in cluster:
+                        event_classifications[fe.event_id] = "lateral_movement_candidate"
+                    alert_counter += 1
+                    alerts.append(
+                        Alert(
+                            alert_id=f"alert-{alert_counter:04d}",
+                            category="lateral_movement",
+                            actor=actor,
+                            session_id=cluster[0].session_id,
+                            correlation_id=cluster[0].correlation_id,
+                            services=services,
+                            event_ids=[fe.event_id for fe in cluster],
+                            rule="sliding_window_unexpected_service_edges",
+                            path=path_str,
+                            outcomes=[fe.outcome for fe in cluster],
+                            explanation=(
+                                f"{len(cluster)} unexpected service edges by {actor} within "
+                                f"{self.lateral_window_seconds}s window (across rotating correlation/session IDs): "
+                                f"{path_str}."
+                            ),
+                        )
+                    )
+                else:
+                    for fe in cluster:
+                        event_classifications[fe.event_id] = "isolated_denial" if fe.outcome == "deny" else "routine"
 
         # Classify remaining benign events
         for evt in timeline:
